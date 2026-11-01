@@ -1,0 +1,6 @@
+---
+- name: Install {{ sc_key.cert }}
+  ansible.windows.win_copy:
+    dest: "{{ sc_key.cert }}"
+    content: "{{ sc_cert.content | b64decode }}"
+  notify: Restart sshd (Windows)

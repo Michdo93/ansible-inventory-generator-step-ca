@@ -1,0 +1,125 @@
+---
+- name: Trust the SSH user CA
+  ansible.builtin.copy:
+    dest: /etc/ssh/ssh_user_ca.pub
+    content: "{{ sc.sc_user_ca }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sshd
+
+- name: Create /etc/ssh/auth_principals
+  ansible.builtin.file:
+    path: /etc/ssh/auth_principals
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Accept the principals {{ sc_principals | join(', ') }} for {{ sc_user }}
+  ansible.builtin.copy:
+    dest: /etc/ssh/auth_principals/{{ sc_user }}
+    content: "{{ sc_principals | join('\n') }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Read the host keys and their certificates
+  ansible.builtin.script:
+    cmd: files/cert_status.py
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  register: sc_status_raw
+  changed_when: false
+
+- name: Decide which host certificates must be (re)issued
+  vars:
+    sc_status: "{{ sc_status_raw.stdout | from_json }}"
+    sc_renew_seconds: >-
+      {{ (ssh_ca_host_cert_renew_before | regex_replace('h$', '') | int) * 3600 }}
+  ansible.builtin.set_fact:
+    sc_host_keys: "{{ sc_status['keys'] }}"
+    sc_to_sign: >-
+      {{ sc_status['keys'] | selectattr('exists', 'equalto', false) | list
+         + (sc_status['keys'] | selectattr('exists') | rejectattr('ca_fp', 'in', sc.sc_host_ca_fps) | list)
+         + (sc_status['keys'] | selectattr('exists') | selectattr('valid_to', 'lt', sc_status.now + sc_renew_seconds | int) | list)
+         + (sc_status['keys'] | selectattr('exists') | rejectattr('principals', 'equalto', sc_host_names | sort) | list) }}
+
+- name: Sign host keys
+  ansible.builtin.include_tasks: sign_host_key.yml
+  loop: "{{ sc_to_sign | unique(attribute='pub') }}"
+  loop_control:
+    loop_var: sc_key
+    label: "{{ sc_key.pub }}"
+
+- name: Is sshd_config.d included?
+  ansible.builtin.command: grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config
+  register: sc_include
+  changed_when: false
+  failed_when: false
+
+- name: Configure sshd
+  vars:
+    sc_sshd_lines: |
+      # Managed by ansible-inventory-generator-step-ca
+      TrustedUserCAKeys /etc/ssh/ssh_user_ca.pub
+      AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u
+      {% for key in sc_host_keys %}
+      HostCertificate {{ key.cert }}
+      {% endfor %}
+  block:
+    - name: Write /etc/ssh/sshd_config.d/05-ansible-step-ca.conf
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/05-ansible-step-ca.conf
+        content: "{{ sc_sshd_lines }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: sc_include.rc == 0
+      notify: Reload sshd
+
+    - name: Add the settings to the top of /etc/ssh/sshd_config
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        insertbefore: BOF
+        marker: "# {mark} ansible-inventory-generator-step-ca"
+        block: "{{ sc_sshd_lines }}"
+      when: sc_include.rc != 0
+      notify: Reload sshd
+
+    - name: Validate the sshd configuration
+      ansible.builtin.command: sshd -t
+      changed_when: false
+  rescue:
+    - name: Remove the drop-in again
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/05-ansible-step-ca.conf
+        state: absent
+      when: sc_include.rc == 0
+
+    - name: Remove the block again
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ansible-inventory-generator-step-ca"
+        state: absent
+      when: sc_include.rc != 0
+
+    - name: Stop on invalid configuration
+      ansible.builtin.fail:
+        msg: "sshd rejected the configuration; it was reverted. See the 'Validate' task output above."
+
+- name: Check that the settings are effective (first value wins in sshd)
+  ansible.builtin.command: sshd -T
+  register: sc_sshd_t
+  changed_when: false
+
+- name: Fail if another directive overrides the CA settings
+  ansible.builtin.assert:
+    that:
+      - "'trustedusercakeys /etc/ssh/ssh_user_ca.pub' in sc_sshd_t.stdout_lines"
+      - "'authorizedprincipalsfile /etc/ssh/auth_principals/%u' in sc_sshd_t.stdout_lines"
+    fail_msg: >-
+      sshd uses a different TrustedUserCAKeys or AuthorizedPrincipalsFile, set earlier in its
+      configuration. Remove that directive or merge it with /etc/ssh/ssh_user_ca.pub.
+
+- name: Apply the sshd changes before the login test
+  ansible.builtin.meta: flush_handlers

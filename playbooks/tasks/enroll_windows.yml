@@ -1,0 +1,98 @@
+---
+# Windows OpenSSH Server (requires the ansible.windows collection). Not tested on real hosts yet.
+- name: Trust the SSH user CA and accept the principals
+  ansible.windows.win_powershell:
+    parameters:
+      UserCa: "{{ sc.sc_user_ca }}"
+      User: "{{ sc_user }}"
+      Principals: "{{ sc_principals | join(',') }}"
+    script: |
+      param([string]$UserCa, [string]$User, [string]$Principals)
+      $ErrorActionPreference = 'Stop'
+      $ssh = Join-Path $env:ProgramData 'ssh'
+      $changed = $false
+      $caFile = Join-Path $ssh 'ssh_user_ca.pub'
+      $old = if (Test-Path $caFile) { (Get-Content $caFile -Raw).Trim() } else { '' }
+      if ($old -ne $UserCa.Trim()) { Set-Content -LiteralPath $caFile -Value $UserCa.Trim() -Encoding ascii; $changed = $true }
+      $dir = Join-Path $ssh 'auth_principals'
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+      $pFile = Join-Path $dir $User
+      $want = ($Principals -split ',') -join "`r`n"
+      $oldP = if (Test-Path $pFile) { (Get-Content $pFile -Raw).Trim() } else { '' }
+      if ($oldP -ne $want) { Set-Content -LiteralPath $pFile -Value ($Principals -split ',') -Encoding ascii; $changed = $true }
+      foreach ($f in @($caFile, $dir, $pFile)) {
+        & icacls.exe $f /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' /grant '*S-1-5-11:R' | Out-Null
+      }
+      $Ansible.Changed = $changed
+  notify: Restart sshd (Windows)
+
+- name: Read the host keys and their certificates
+  ansible.windows.win_powershell:
+    script: |
+      $Ansible.Changed = $false
+      $ssh = Join-Path $env:ProgramData 'ssh'
+      $keygen = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh-keygen.exe'
+      $now = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+      $keys = foreach ($pub in Get-ChildItem $ssh -Filter 'ssh_host_*_key.pub') {
+        $cert = $pub.FullName -replace '\.pub$', '-cert.pub'
+        $e = [ordered]@{ pub = $pub.FullName; cert = $cert; pubkey = (Get-Content $pub.FullName -Raw).Trim();
+                         exists = $false; valid_to = 0; ca_fp = ''; principals = @() }
+        if (Test-Path $cert) {
+          $out = (& $keygen -L -f $cert) -join "`n"
+          $e.exists = $true
+          if ($out -match 'Valid: .*? to (\S+)') { $e.valid_to = [DateTimeOffset]::new([datetime]::Parse($Matches[1])).ToUnixTimeSeconds() }
+          if ($out -match 'Signing CA: \S+ (SHA256:\S+)') { $e.ca_fp = $Matches[1] }
+          if ($out -match '(?s)Principals:\s*\n(.*?)\n\s*Critical') { $e.principals = @(($Matches[1] -split '\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) | Sort-Object) }
+        }
+        [pscustomobject]$e
+      }
+      [pscustomobject]@{ now = $now; keys = @($keys) }
+  register: sc_win_status
+
+- name: Decide which host certificates must be (re)issued
+  vars:
+    sc_status: "{{ sc_win_status.output[0] }}"
+    sc_renew_seconds: "{{ (ssh_ca_host_cert_renew_before | regex_replace('h$', '') | int) * 3600 }}"
+  ansible.builtin.set_fact:
+    sc_host_keys: "{{ sc_status['keys'] }}"
+    sc_to_sign: >-
+      {{ sc_status['keys'] | selectattr('exists', 'equalto', false) | list
+         + (sc_status['keys'] | selectattr('exists') | rejectattr('ca_fp', 'in', sc.sc_host_ca_fps) | list)
+         + (sc_status['keys'] | selectattr('exists') | selectattr('valid_to', 'lt', sc_status.now + sc_renew_seconds | int) | list)
+         + (sc_status['keys'] | selectattr('exists') | rejectattr('principals', 'equalto', sc_host_names | sort) | list) }}
+
+- name: Sign host keys
+  ansible.builtin.include_tasks: sign_host_key.yml
+  loop: "{{ sc_to_sign | unique(attribute='pub') }}"
+  loop_control:
+    loop_var: sc_key
+    label: "{{ sc_key.pub }}"
+
+- name: Configure sshd (before the first Match block)
+  ansible.windows.win_powershell:
+    parameters:
+      Certs: "{{ sc_host_keys | map(attribute='cert') | join(',') }}"
+    script: |
+      param([string]$Certs)
+      $ErrorActionPreference = 'Stop'
+      $config = Join-Path $env:ProgramData 'ssh\sshd_config'
+      $lines = @(Get-Content -LiteralPath $config)
+      $begin = '# BEGIN ansible-inventory-generator-step-ca'; $end = '# END ansible-inventory-generator-step-ca'
+      $clean = [System.Collections.Generic.List[string]]::new(); $skip = $false
+      foreach ($l in $lines) { if ($l -eq $begin) { $skip = $true; continue }; if ($l -eq $end) { $skip = $false; continue }; if (-not $skip) { $clean.Add($l) } }
+      $block = @($begin, 'TrustedUserCAKeys __PROGRAMDATA__/ssh/ssh_user_ca.pub', 'AuthorizedPrincipalsFile __PROGRAMDATA__/ssh/auth_principals/%u')
+      foreach ($c in ($Certs -split ',')) { $block += 'HostCertificate ' + ($c -replace '\\', '/') }
+      $block += $end
+      $idx = 0; for ($i = 0; $i -lt $clean.Count; $i++) { if ($clean[$i] -match '^\s*Match\s') { $idx = $i; break }; $idx = $clean.Count }
+      $new = @($clean[0..($idx - 1)]) + $block + @(if ($idx -lt $clean.Count) { $clean[$idx..($clean.Count - 1)] })
+      if (($new -join "`n") -ne ($lines -join "`n")) {
+        Copy-Item $config "$config.bak" -Force
+        Set-Content -LiteralPath $config -Value $new -Encoding ascii
+        & (Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe') -t
+        if ($LASTEXITCODE -ne 0) { Copy-Item "$config.bak" $config -Force; throw 'sshd rejected the configuration; reverted.' }
+        $Ansible.Changed = $true
+      } else { $Ansible.Changed = $false }
+  notify: Restart sshd (Windows)
+
+- name: Apply the sshd changes before the login test
+  ansible.builtin.meta: flush_handlers

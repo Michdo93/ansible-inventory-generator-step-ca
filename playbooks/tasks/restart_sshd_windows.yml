@@ -1,0 +1,5 @@
+---
+- name: Restart sshd
+  ansible.windows.win_service:
+    name: sshd
+    state: restarted

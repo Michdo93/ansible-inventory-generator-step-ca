@@ -1,0 +1,91 @@
+---
+- name: Create a known_hosts file that trusts only the host CA
+  delegate_to: localhost
+  become: false
+  ansible.builtin.tempfile:
+    suffix: known_hosts
+  register: sc_kh
+  changed_when: false
+
+- name: Verify the login with the user certificate and the host certificate only
+  delegate_to: localhost
+  become: false
+  block:
+    - name: Write the host CA into the temporary known_hosts
+      ansible.builtin.copy:
+        dest: "{{ sc_kh.path }}"
+        content: |
+          {% for key in sc.sc_host_ca.splitlines() %}
+          @cert-authority * {{ key }}
+          {% endfor %}
+        mode: "0600"
+      changed_when: false
+
+    - name: Log in with the certificate (no static key, no known host key)
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -F
+          - /dev/null
+          - -o
+          - BatchMode=yes
+          - -o
+          - ConnectTimeout=15
+          - -o
+          - IdentitiesOnly=yes
+          - -i
+          - "{{ ssh_ca_key_file }}"   # ssh loads <key>-cert.pub automatically
+          - -o
+          - PubkeyAcceptedAlgorithms=ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com
+          - -o
+          - HostKeyAlgorithms=ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com
+          - -o
+          - "UserKnownHostsFile={{ sc_kh.path }}"
+          - -o
+          - GlobalKnownHostsFile=/dev/null
+          - -o
+          - StrictHostKeyChecking=yes
+          - -p
+          - "{{ sc_port }}"
+          - "{{ sc_user }}@{{ sc_address }}"
+          - exit
+      register: sc_login
+      changed_when: false
+      failed_when: false
+  always:
+    - name: Remove the temporary known_hosts
+      ansible.builtin.file:
+        path: "{{ sc_kh.path }}"
+        state: absent
+      changed_when: false
+
+- name: Stop if the certificate login does not work
+  ansible.builtin.fail:
+    msg: >-
+      Certificate login as {{ sc_user }}@{{ sc_address }}:{{ sc_port }} failed, the static key was kept.
+      ssh said: {{ sc_login.stderr | trim }}
+  when: sc_login.rc != 0
+
+- name: Remove the static control node key (Linux)
+  when: ssh_ca_remove_static_key | bool and ansible_facts['os_family'] != 'Windows'
+  block:
+    - name: Look up the home directory of {{ sc_user }}
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ sc_user }}"
+
+    - name: Remove the key from authorized_keys
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_facts['getent_passwd'][sc_user][4] }}/.ssh/authorized_keys"
+        regexp: "^(.*\\s)?[a-z0-9@.-]+\\s{{ sc.sc_ctl_blob | regex_escape }}(\\s.*)?$"
+        state: absent
+
+- name: Remove the static control node key (Windows)
+  ansible.builtin.include_tasks: remove_static_key_windows.yml
+  when: ssh_ca_remove_static_key | bool and ansible_facts['os_family'] == 'Windows'
+
+- name: Result
+  ansible.builtin.debug:
+    msg: >-
+      {{ sc_user }}@{{ sc_address }} accepts the step-ca certificate; host certificate valid for
+      {{ sc_host_names | join(', ') }}{{ '; static key removed' if ssh_ca_remove_static_key | bool else '' }}.

@@ -1,0 +1,54 @@
+---
+# Sign one host public key on the control node and install the certificate.
+# Input: sc_key (entry of cert_status), sc_host_names
+- name: Sign {{ sc_key.pub | basename }}
+  delegate_to: localhost
+  become: false
+  environment:
+    STEPPATH: "{{ ssh_ca_steppath }}"
+  block:
+    - name: Create a temporary directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: hostcert
+      register: sc_tmp
+
+    - name: Write the host public key
+      ansible.builtin.copy:
+        dest: "{{ sc_tmp.path }}/key.pub"
+        content: "{{ sc_key.pubkey }}\n"
+        mode: "0644"
+
+    - name: Request the host certificate
+      ansible.builtin.command:
+        argv: >-
+          {{ ['step', 'ssh', 'certificate', inventory_hostname, sc_tmp.path ~ '/key.pub', '--host', '--sign', '--force',
+              '--provisioner', ssh_ca_provisioner, '--provisioner-password-file', ssh_ca_provisioner_password_file,
+              '--not-after', ssh_ca_host_cert_duration]
+             + (sc_host_names | map('regex_replace', '^', '--principal=') | list) }}
+      changed_when: true
+
+    - name: Read the host certificate
+      ansible.builtin.slurp:
+        src: "{{ sc_tmp.path }}/key-cert.pub"
+      register: sc_cert
+  always:
+    - name: Remove the temporary directory
+      ansible.builtin.file:
+        path: "{{ sc_tmp.path }}"
+        state: absent
+      when: sc_tmp.path is defined
+
+- name: Install {{ sc_key.cert }}
+  ansible.builtin.copy:
+    dest: "{{ sc_key.cert }}"
+    content: "{{ sc_cert.content | b64decode }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sshd
+  when: ansible_facts['os_family'] != 'Windows'
+
+- name: Install {{ sc_key.cert }} (Windows)
+  ansible.builtin.include_tasks: install_cert_windows.yml
+  when: ansible_facts['os_family'] == 'Windows'
