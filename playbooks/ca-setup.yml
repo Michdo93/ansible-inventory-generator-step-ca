@@ -2,7 +2,8 @@
 # Install and initialise step-ca with an SSH CA on one Linux host of the inventory.
 #   ansible-playbook playbooks/ca-setup.yml -e ca_host=<inventory name> -e 'ca_user_principals=["ansible"]'
 # Re-running it is safe: it only updates the binaries (if the version changed),
-# the provisioner and the principal policy.
+# the provisioner and the principal policy. Principals listed in /etc/step-ca/extra-principals
+# (written by ansible-ssh-key-distribution-step-ca) are kept in the policy.
 
 - name: Set up step-ca
   hosts: "{{ ca_host }}"
@@ -164,14 +165,21 @@
         src: "{{ ca_dir }}/config/ca.json"
       register: ca_json_raw
 
+    - name: Read extra principals (maintained by ansible-ssh-key-distribution-step-ca)
+      ansible.builtin.slurp:
+        src: "{{ ca_dir }}/extra-principals"
+      register: ca_extra_raw
+      failed_when: false
+
     - name: Write the SSH policy (allowed principals and host names)
       vars:
         ca_json: "{{ ca_json_raw.content | b64decode | from_json }}"
+        ca_extra_principals: "{{ (ca_extra_raw.content | default('') | b64decode).split() }}"
         ca_host_rules: >-
           {{ {'allow': dict(([('dns', ca_host_allow_dns)] if ca_host_allow_dns else [])
                             + ([('ip', ca_host_allow_ips)] if ca_host_allow_ips else []))}
              if (ca_host_allow_dns or ca_host_allow_ips) else {'deny': {'dns': ['localhost', 'localhost.localdomain']}} }}
-        ca_policy: "{{ {'ssh': {'user': {'allow': {'principal': ca_user_principals | unique}}, 'host': ca_host_rules}} }}"
+        ca_policy: "{{ {'ssh': {'user': {'allow': {'principal': (ca_user_principals + ca_extra_principals) | unique}}, 'host': ca_host_rules}} }}"
       ansible.builtin.copy:
         dest: "{{ ca_dir }}/config/ca.json"
         content: "{{ ca_json | combine({'authority': ca_json.authority | combine({'policy': ca_policy})}) | to_nice_json(indent=2) }}\n"
