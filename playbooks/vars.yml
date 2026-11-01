@@ -1,0 +1,23 @@
+---
+# Shared defaults of ca-setup.yml and enroll.yml. The entry script passes the
+# control-node specific values with -e @<config dir>/enroll-vars.yml.
+
+# --- control node -----------------------------------------------------------
+ssh_ca_dir: "{{ lookup('env', 'ANSIBLE_STEP_CA_DIR') | default(lookup('env', 'HOME') ~ '/.config/ansible-step-ca', true) }}"
+ssh_ca_steppath: "{{ ssh_ca_dir }}/step"
+ssh_ca_provisioner: ansible-ssh
+ssh_ca_provisioner_password_file: "{{ ssh_ca_dir }}/provisioner-password"
+ssh_ca_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519"
+ssh_ca_known_hosts: "{{ lookup('env', 'HOME') }}/.ssh/known_hosts"
+
+# --- certificates -------------------------------------------------------------
+ssh_ca_user_cert_duration: 4h        # control node user certificate (refreshed hourly)
+ssh_ca_host_cert_duration: 720h      # host certificates (30 days)
+ssh_ca_host_cert_renew_before: 240h  # renew host certificates 10 days before expiry
+
+# --- managed hosts --------------------------------------------------------------
+# Remove the bootstrap public key of the control node from authorized_keys once
+# certificate login has been verified. Afterwards only certificates are accepted.
+ssh_ca_remove_static_key: true
+# Additional principals accepted for the Ansible account on a host (per host/group).
+ssh_ca_extra_principals: []

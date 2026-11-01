@@ -1,0 +1,135 @@
+---
+# Switch managed hosts from static public keys to step-ca SSH certificates.
+#   ansible-playbook playbooks/enroll.yml -e @~/.config/ansible-step-ca/enroll-vars.yml [--limit lab]
+#
+# Per host: trust the SSH user CA, accept the Ansible account's principal, sign all host
+# keys (renewed before they expire), verify a certificate-only login and then remove the
+# control node's static public key. Safe to re-run; the daily timer does exactly that.
+
+- name: Prepare the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [vars.yml]
+  environment:
+    STEPPATH: "{{ ssh_ca_steppath }}"
+  tasks:
+    - name: Read the SSH user and host CA keys from step-ca
+      ansible.builtin.command: step ssh config {{ item }} --roots
+      loop: ["", "--host"]
+      register: sc_roots
+      changed_when: false
+
+    - name: Fingerprints of the host CA keys
+      ansible.builtin.shell: set -o pipefail; printf '%s\n' "$KEYS" | ssh-keygen -lf - | awk '{print $2}'
+      args:
+        executable: /bin/bash
+      environment:
+        KEYS: "{{ sc_roots.results[1].stdout }}"
+      register: sc_host_ca_fps
+      changed_when: false
+
+    - name: Read the control node public key
+      ansible.builtin.slurp:
+        src: "{{ ssh_ca_key_file }}.pub"
+      register: sc_ctl_pub
+
+    - name: Read the control node certificate
+      ansible.builtin.command: ssh-keygen -L -f {{ ssh_ca_key_file }}-cert.pub
+      register: sc_ctl_cert
+      changed_when: false
+      failed_when: false
+
+    - name: Remember CA data
+      ansible.builtin.set_fact:
+        sc_user_ca: "{{ sc_roots.results[0].stdout | trim }}"
+        sc_host_ca: "{{ sc_roots.results[1].stdout | trim }}"
+        sc_host_ca_fps: "{{ sc_host_ca_fps.stdout_lines }}"
+        sc_ctl_blob: "{{ (sc_ctl_pub.content | b64decode).split()[1] }}"
+        sc_ctl_principals: >-
+          {{ (sc_ctl_cert.stdout | regex_search('Principals:\s*\n((?:\s{16}\S.*\n?)*)', '\1') | default([''], true) | first)
+             .split() }}
+
+    - name: Check the CA data and the control node certificate
+      ansible.builtin.assert:
+        that:
+          - sc_user_ca | length > 0
+          - sc_host_ca | length > 0
+          - sc_ctl_cert.rc == 0
+        fail_msg: >-
+          No CA keys or no certificate {{ ssh_ca_key_file }}-cert.pub. Run generate-inventory-step-ca.sh
+          (or {{ ssh_ca_dir }}/ssh-cert-refresh.sh) first.
+
+    - name: Trust the host CA for the inventory hosts (control node known_hosts)
+      vars:
+        sc_patterns: >-
+          {{ query('inventory_hostnames', 'all') | map('extract', hostvars) | map(attribute='ansible_host', default=None)
+             | zip(query('inventory_hostnames', 'all'), query('inventory_hostnames', 'all') | map('extract', hostvars)
+                   | map(attribute='ansible_port', default=22))
+             | map('join', '|') | list }}
+      ansible.builtin.blockinfile:
+        path: "{{ ssh_ca_known_hosts }}"
+        create: true
+        mode: "0600"
+        marker: "# {mark} ansible-step-ca host CA"
+        block: |
+          {% set names = [] %}
+          {% for item in sc_patterns %}
+          {%   set host, alias, port = item.split('|') %}
+          {%   for n in [host, alias] if n and n != 'None' %}
+          {%     set _ = names.append(n if port | int == 22 else '[' ~ n ~ ']:' ~ port) %}
+          {%   endfor %}
+          {% endfor %}
+          {% for key in sc_host_ca.splitlines() %}
+          @cert-authority {{ names | unique | join(',') }} {{ key }}
+          {% endfor %}
+
+- name: Enroll hosts
+  hosts: all
+  gather_facts: true
+  become: true
+  vars_files: [vars.yml]
+  vars:
+    sc: "{{ hostvars['localhost'] }}"
+    sc_user: "{{ ansible_user }}"
+    sc_address: "{{ ansible_host | default(inventory_hostname) }}"
+    sc_port: "{{ ansible_port | default(22) }}"
+    sc_principals: "{{ ([ansible_user] + ssh_ca_extra_principals) | unique }}"
+    sc_host_names: >-
+      {{ ([inventory_hostname, sc_address, ansible_facts['hostname'] | default(''), ansible_facts['fqdn'] | default('')]
+          + (ansible_facts['all_ipv4_addresses'] | default([])))
+         | select | reject('in', ['localhost', 'localhost.localdomain']) | unique | list }}
+  tasks:
+    - name: Check that the control node certificate covers {{ sc_user }}
+      ansible.builtin.assert:
+        that: sc_user in sc.sc_ctl_principals
+        fail_msg: >-
+          The control node certificate has the principals {{ sc.sc_ctl_principals }}, but this host
+          uses ansible_user={{ sc_user }}. Add it to PRINCIPALS in {{ ssh_ca_dir }}/config.env (and to the
+          CA policy), then run {{ ssh_ca_dir }}/ssh-cert-refresh.sh.
+
+    - name: Linux hosts
+      ansible.builtin.include_tasks: tasks/enroll_linux.yml
+      when: ansible_facts['os_family'] != 'Windows'
+
+    - name: Windows hosts
+      ansible.builtin.include_tasks: tasks/enroll_windows.yml
+      when: ansible_facts['os_family'] == 'Windows'
+
+    - name: Verify a certificate-only login (user and host certificate)
+      ansible.builtin.include_tasks: tasks/verify_and_cleanup.yml
+
+  handlers:
+    - name: Reload sshd
+      ansible.builtin.shell: |
+        if [ -d /run/systemd/system ]; then
+          systemctl reload ssh 2>/dev/null || systemctl reload sshd
+        elif [ -s /run/sshd.pid ]; then
+          kill -HUP "$(cat /run/sshd.pid)"
+        else
+          service ssh reload 2>/dev/null || service sshd reload
+        fi
+      changed_when: true
+
+    - name: Restart sshd (Windows)
+      ansible.builtin.include_tasks: tasks/restart_sshd_windows.yml
