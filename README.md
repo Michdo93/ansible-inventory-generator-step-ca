@@ -112,7 +112,7 @@ Installs `step` and `step-ca` from the GitHub releases, initialises a CA with SS
 - a JWK provisioner `ansible-ssh` (user certificates: default 4 h, max 24 h; host certificates: default 30 days, max 90 days),
 - an **authority policy**: SSH user certificates may only contain the Ansible account names (`ca_user_principals`); host certificates for any name except `localhost` (restrict with `ca_host_allow_dns` / `ca_host_allow_ips`).
 
-Passwords are generated on the CA host and stay there (`/etc/step-ca/*.txt`); only the provisioner password is copied to the control node. Re-running the playbook updates the policy – the entry script does this automatically when the inventory gets a new `ansible_user`.
+Passwords are generated on the CA host and stay there (`/etc/step-ca/*.txt`); only the provisioner password is copied to the control node. Re-running the playbook updates the policy – the entry script does this automatically when the inventory gets a new `ansible_user`. Principals listed in `/etc/step-ca/extra-principals` are kept; [ansible-ssh-key-distribution-step-ca](https://github.com/Michdo93/ansible-ssh-key-distribution-step-ca) maintains that file for the certificates it hands out to other accounts.
 
 Using an existing step-ca instead: it needs SSH enabled (`step ca init --ssh`), a JWK provisioner with SSH certificates, and the account names allowed as user principals, e.g. in `ca.json`:
 
